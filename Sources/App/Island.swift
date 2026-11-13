@@ -89,12 +89,34 @@ final class IslandController: NSObject {
     private var revealUntil = Date.distantPast
     private var screenID: CGDirectDisplayID = 0
     private var bubble: BubbleView?
-    private var openSide: Side?
-    /// Session previewed in the tray per agent (hovering its pip), and where those pips are.
-    private var selected: [String: String] = [:]
-    private var pipHits: [(rect: CGRect, key: String)] = []
-    /// Agent picked with the arrow keys while a tray is open, and the app to hand keys back to.
-    private var keyFocus: String?
+    private var openSide: Side? {
+        didSet {
+            guard openSide != oldValue else { return }
+            focusKey = nil
+            zoneOrder = []
+            roll = nil
+            lens = nil
+        }
+    }
+    /// The open side's sessions, one zone each: their order (frozen while open, so a zone never
+    /// changes owner under the pointer) and where the zones are.
+    private var zoneOrder: [String] = []
+    private var zoneHits: [(rect: CGRect, key: String)] = []
+    /// The open side's pets ride a strip at most `maxFlat` pets wide, through a fisheye: each has a
+    /// resting spot, spread evenly across the strip, and the pointer (`lens`) magnifies its
+    /// neighbourhood to full size while the rest squeeze toward the strip's fixed ends. So the pet
+    /// under the pointer is always the picked one, and a short move runs through many. `roll` is
+    /// the (fractional) index under the lens, in on-screen left-to-right order.
+    private var strip: (area: CGRect, hit: CGRect, keys: [String], step: CGFloat)?
+    private var roll: CGFloat?
+    private var lens: CGFloat?
+    private var compactUsage = false
+    private var petY: CGFloat = 0
+    /// Shrinks an open side's pets to fit under its usage line; the tallest open pet's height.
+    private var petFit: CGFloat = 1, petTall: CGFloat = 0
+    private var ticker: DispatchSourceTimer?
+    /// Session whose zone is hovered or picked with the keys, and the app to hand keys back to.
+    private var focusKey: String?
     private var keyOwner: NSRunningApplication?
     private var tray: TrayView?
     private var trayKey = ""
@@ -103,7 +125,7 @@ final class IslandController: NSObject {
     private let config: ConfigStore
     var menu: (() -> NSMenu)?
 
-    private let pad: CGFloat = 12, gap: CGFloat = 10, stackStep: CGFloat = 11, maxStack = 4
+    private let pad: CGFloat = 12, gap: CGFloat = 10, stackStep: CGFloat = 11, maxStack = 4, maxZones = 16, maxFlat = 3
     private var bodyH: CGFloat { (notch.height * 0.56).rounded() }
     /// The window pokes a few points above the screen so the topmost pixel row, where a pointer
     /// pinned to the edge sits, is inside it rather than on its border.
@@ -222,16 +244,6 @@ final class IslandController: NSObject {
         if !done.subtracting(finished).isEmpty && !menuBarDown { flash() }
         finished = done
         hush(!menuBarDown && pending == nil && Date() >= flashUntil)
-        if pending != nil, !windowTall {
-            fitWindow(tall: true)
-        } else if pending == nil, windowTall {
-            shrinkToken += 1
-            let token = shrinkToken
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-                guard let self, token == self.shrinkToken, self.store.pending.isEmpty else { return }
-                self.fitWindow(tall: false)
-            }
-        }
         if show && !visible {
             visible = true
             collapse()
@@ -275,31 +287,58 @@ final class IslandController: NSObject {
             openSide = side
         }
         trayRects = [:]
-        var openRows: [TrayView.Row] = []
+        zoneHits = []
+        strip = nil
+        var textRect: CGRect?, petsRect: CGRect?, focusRow: TrayView.Row?
         for side in [Side.left, .right] {
-            let rows = sides[side]!
             let path: CGPath
             if side == openSide {
-                openRows = trayRows(rows)
-                let widths = openRows.map(TrayView.width)
-                let w = max(widths.reduce(TrayView.inset, +), wings[side]!.width)
-                let r = side == .left ? CGRect(x: notch.minX - w, y: notch.minY, width: w, height: notch.height)
-                                      : CGRect(x: notch.maxX, y: notch.minY, width: w, height: notch.height)
+                // Every session gets a zone of its own, its pet fanned out from the stack into it,
+                // and the text beyond tells the one under the pointer.
+                let rows = zoneRows(sides[side]!)
+                let dir: CGFloat = side == .left ? -1 : 1
+                let x0 = side == .left ? notch.minX - pad + 4 : notch.maxX + pad - 4
+                petTall = rows.map { bodyH * $0.sprite.weight }.max() ?? bodyH
+                let step = (rows.map { (bodyH * $0.sprite.weight * $0.sprite.bodyAspect).rounded() }.max() ?? 24) + 1
+                let pets = step * CGFloat(min(rows.count, maxFlat))
+                // The usage line sits above the pets, a little past them at most; when the full line
+                // won't fit it names only the window nearest its limit.
+                let full = TrayView.usageWidth(rows.map(\.row), compact: false)
+                compactUsage = full > pets + 12
+                let span = max(pets, (compactUsage ? TrayView.usageWidth(rows.map(\.row), compact: true) : full) - 12)
+                let hit = CGRect(x: min(x0, x0 + dir * span), y: notch.minY, width: span, height: notch.height)
+                // Left to right on screen: on the left the first zone is the one nearest the notch.
+                let keys = rows.map(\.row.session.key)
+                strip = (hit.insetBy(dx: (span - pets) / 2, dy: 0), hit, side == .left ? keys.reversed() : keys, step)
+                if roll == nil, let f = focusKey, let i = strip!.keys.firstIndex(of: f) { roll = CGFloat(i) }
+                let area = hit
+                let tw = TrayView.width(rows.map(\.row))
+                let x = x0 + dir * (span + 8)
+                petsRect = area
+                let tr = CGRect(x: side == .left ? x - tw : x, y: notch.minY, width: tw, height: notch.height)
+                let outer = side == .left ? min(tr.minX - 16, minX) : max(tr.maxX + 16, maxX)
+                let r = side == .left ? CGRect(x: outer, y: notch.minY, width: notch.minX - outer, height: notch.height)
+                                      : CGRect(x: notch.maxX, y: notch.minY, width: outer - notch.maxX, height: notch.height)
                 trayRects[side] = r
+                textRect = tr
+                focusRow = rows.first { $0.row.session.key == focusKey }?.row
                 path = side == .left ? shape(r.minX, notch.maxX, notch.minY, barRadius) : shape(notch.minX, r.maxX, notch.minY, barRadius)
-                for (i, (a, _)) in rows.enumerated() {
-                    let seg = TrayView.segment(i, side: side, in: r, widths: widths)
-                    let ix = side == .left ? seg.minX + TrayView.edge + TrayView.iconW / 2 : seg.maxX - TrayView.edge - TrayView.iconW / 2
-                    targets[a.id] = (CGPoint(x: ix, y: notch.midY), 1)
-                    hits[a.id] = seg
-                }
             } else {
                 path = side == .left ? shape(minX, notch.maxX, notch.minY, barRadius) : shape(notch.minX, maxX, notch.minY, barRadius)
             }
             set(trays[side]!, path, animated: animated)
             set(trayMasks[side]!, path, animated: animated)
         }
-        updateTrayView(openRows)
+        updateTrayView(focusRow, text: textRect, pets: petsRect)
+        // Under a usage line, the pets fit the band between it and the bottom edge, picked one included.
+        if focusRow?.usage != nil {
+            let band = notch.height - 13
+            petY = notch.minY + 1 + band / 2
+            petFit = min(1, band / (petTall * ((strip?.keys.count ?? 1) > 1 ? 1.08 : 1)))
+        } else {
+            petY = notch.midY
+            petFit = 1
+        }
 
         // Questions: the island morphs wider and taller in one spring (the asking side widens with
         // it), and the content fades up into place partway through.
@@ -316,17 +355,29 @@ final class IslandController: NSObject {
             dismissBubble()
             set(panel, notchPath, animated: animated)
         }
+        let tall = pending != nil
+        if tall, !windowTall {
+            fitWindow(tall: true)
+        } else if !tall, windowTall {
+            shrinkToken += 1
+            let token = shrinkToken
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self, token == self.shrinkToken, self.store.pending.isEmpty else { return }
+                self.fitWindow(tall: false)
+            }
+        }
 
-        // One mascot per session: the most urgent (or previewed) in front, the rest stacked behind it.
+        // One mascot per session: the most urgent in front, the rest stacked behind it; on an open
+        // side each stands in its own zone, the hovered one lit.
         var live = Set<String>()
         for side in [Side.left, .right] {
             let dir: CGFloat = side == .left ? -1 : 1
+            let open = side == openSide
             for (a, _) in sides[side]! {
                 let t = targets[a.id]!
                 let sprite = SpriteLibrary.sprite(for: a)
-                var ss = Array(store.sessions(of: a.id))
-                if let k = selected[a.id], let i = ss.firstIndex(where: { $0.key == k }) { ss.insert(ss.remove(at: i), at: 0) }
-                for (k, s) in ss.prefix(maxStack).enumerated() {
+                let ss = store.sessions(of: a.id)
+                for (k, s) in (open ? ss : Array(ss.prefix(maxStack))).enumerated() {
                     live.insert(s.key)
                     let slot: Slot
                     if let old = slots[s.key], !old.leaving {
@@ -339,6 +390,22 @@ final class IslandController: NSObject {
                         slot.layer.position = behindNotch(sprite, left: side == .left)
                         slotLayer.addSublayer(slot.layer)
                         slots[s.key] = slot
+                    }
+                    if open {
+                        let p = place(s.key)
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        slot.layer.zPosition = p?.z ?? 0
+                        CATransaction.commit()
+                        if let p {
+                            fade(slot.layer, to: p.opacity, animated: animated)
+                            move(slot.layer, to: p.pos, animated: animated)
+                            scale(slot.layer, to: p.scale, animated: animated)
+                        } else {
+                            fade(slot.layer, to: 0, animated: animated)   // more sessions than zones
+                        }
+                        apply(slot, store.displayState(s), front: true)
+                        continue
                     }
                     let back = CGFloat(k)
                     CATransaction.begin()
@@ -398,16 +465,20 @@ final class IslandController: NSObject {
         if slot.dot.superlayer == nil { l.addSublayer(slot.dot) }
     }
 
-    private func apply(_ slot: Slot, _ state: AgentState, front: Bool) {
-        let anim: Anim
+    static func anim(_ state: AgentState) -> Anim {
         switch state {
-        case .question: anim = .question
-        case .working: anim = .working
-        case .done: anim = .done
-        case .idle: anim = .idle
-        case .interrupted: anim = .interrupted
-        case .limited: anim = .limited
+        case .question: return .question
+        case .working: return .working
+        case .done: return .done
+        case .idle: return .idle
+        case .interrupted: return .interrupted
+        case .limited: return .limited
+        case .waiting: return .waiting
         }
+    }
+
+    private func apply(_ slot: Slot, _ state: AgentState, front: Bool) {
+        let anim = Self.anim(state)
         if slot.anim != anim {
             slot.anim = anim
             play(slot)
@@ -428,6 +499,18 @@ final class IslandController: NSObject {
             pulse.repeatCount = .infinity
             pulse.preferredFrameRateRange = CAFrameRateRange(minimum: 8, maximum: 15, preferred: 15)
             slot.dot.add(pulse, forKey: "pulse")
+        case .waiting:
+            // A slow breath: alive, but nothing for you yet.
+            slot.dot.backgroundColor = NSColor.systemTeal.cgColor
+            slot.dot.opacity = 1
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 0.9
+            pulse.toValue = 0.3
+            pulse.duration = 1.8
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.preferredFrameRateRange = CAFrameRateRange(minimum: 4, maximum: 10, preferred: 8)
+            slot.dot.add(pulse, forKey: "pulse")
         case .done, .interrupted, .limited:
             slot.dot.backgroundColor = Self.color(state, tint: .white).cgColor
             slot.dot.opacity = 1
@@ -444,14 +527,22 @@ final class IslandController: NSObject {
         case .idle: return NSColor(white: 1, alpha: 0.28)
         case .interrupted: return NSColor(white: 1, alpha: 0.7)
         case .limited: return .systemRed
+        case .waiting: return .systemTeal
         }
     }
 
     private func play(_ slot: Slot) {
-        let l = slot.layer, s = slot.sprite
+        guard let anim = slot.anim else {
+            slot.layer.removeAnimation(forKey: "frames")
+            slot.layer.removeAnimation(forKey: "once")
+            return
+        }
+        Self.play(anim, on: slot.layer, sprite: slot.sprite)
+    }
+
+    static func play(_ anim: Anim, on l: CALayer, sprite s: Sprite) {
         l.removeAnimation(forKey: "frames")
         l.removeAnimation(forKey: "once")
-        guard let anim = slot.anim else { return }
         // Idle fidgets a few times, then holds still on its first frame: resting mascots cost nothing.
         switch anim {
         case .done:
@@ -470,7 +561,7 @@ final class IslandController: NSObject {
         }
     }
 
-    private func track(_ s: Sprite, _ a: Anim, repeats: Float) -> CAKeyframeAnimation {
+    private static func track(_ s: Sprite, _ a: Anim, repeats: Float) -> CAKeyframeAnimation {
         let frames = s.anims[a] ?? s.anims[.idle] ?? [(0, 1000)]
         let total = frames.reduce(0) { $0 + $1.ms }
         let k = CAKeyframeAnimation(keyPath: "contentsRect")
@@ -488,23 +579,30 @@ final class IslandController: NSObject {
 
     // MARK: tray
 
-    private func trayRows(_ agents: [(AgentConfig, AgentSummary)]) -> [TrayView.Row] {
-        agents.map { a, sum in
-            let ss = store.sessions(of: a.id)
-            let i = ss.firstIndex { $0.key == selected[a.id] } ?? 0
-            let s = ss.isEmpty ? nil : ss[i]
-            return TrayView.Row(agent: a, state: s.map(store.displayState) ?? sum.state, session: s, usage: Usage.read(a.id),
-                                states: ss.map(store.displayState), sessions: ss, keys: ss.map(\.key), selected: i, focused: keyFocus == a.id,
-                                switching: ss.count > 1 && selected[a.id] != nil)
+    /// Every session on the side, nearest agent first, in the order they had when the side opened
+    /// (newcomers join at the end). Focus starts on the most urgent.
+    private func zoneRows(_ agents: [(AgentConfig, AgentSummary)]) -> [(row: TrayView.Row, sprite: Sprite)] {
+        var all: [String: (row: TrayView.Row, sprite: Sprite)] = [:], natural: [String] = []
+        for (a, _) in agents {
+            let sprite = SpriteLibrary.sprite(for: a), usage = Usage.read(a.id)
+            for s in store.sessions(of: a.id) {
+                natural.append(s.key)
+                all[s.key] = (TrayView.Row(agent: a, session: s, state: store.displayState(s), usage: usage, jobs: store.jobs(s)), sprite)
+            }
         }
+        zoneOrder = zoneOrder.filter { all[$0] != nil } + natural.filter { !zoneOrder.contains($0) }
+        let rows = zoneOrder.prefix(maxZones).compactMap { all[$0] }
+        if focusKey.map({ k in !rows.contains { $0.row.session.key == k } }) ?? true {
+            focusKey = rows.max { $0.row.state < $1.row.state }?.row.session.key
+        }
+        return rows
     }
 
-    private func updateTrayView(_ rows: [TrayView.Row]) {
-        guard let side = openSide, let r = trayRects[side] else {
+    private func updateTrayView(_ row: TrayView.Row?, text tr: CGRect?, pets pr: CGRect?) {
+        guard let side = openSide, let row, let tr, let pr else {
             trayKey = ""
-            pipHits = []
-            selected = [:]
-            keyFocus = nil
+            ticker?.cancel()
+            ticker = nil
             releaseKeys()
             if let t = tray {
                 tray = nil
@@ -512,23 +610,99 @@ final class IslandController: NSObject {
             }
             return
         }
-        // Rebuild only when something visible changed.
-        let key = "\(side)|\(r)|" + rows.map {
-            "\($0.agent.id)\($0.state)\($0.keys)\($0.states)\($0.selected)\($0.focused)\($0.switching)\($0.session?.action ?? "")\($0.session?.title ?? "")\($0.session?.prompt ?? "")\($0.usage.map { "\($0.binding.label)\(Int($0.binding.used))" } ?? "")\($0.session?.reason ?? "")"
-        }.joined(separator: "|") + "\(rows.map(TrayView.width))"
+        // Rebuild only when something visible changed; the clock refreshes it in place.
+        let s = row.session
+        let r = tr.union(pr)
+        let key = "\(side)|\(r)|\(compactUsage)|\(s.key)|\(row.state)|\(s.task)|\(s.action ?? "")|\(s.reason ?? "")|\(row.jobs)|"
+            + (row.usage.map { $0.windows.map { "\($0.label)\(Int($0.used.rounded()))" }.joined() } ?? "")
         guard key != trayKey else { return }
         let fresh = tray == nil || !trayKey.hasPrefix("\(side)|")
         trayKey = key
         tray?.removeFromSuperview()
-        let t = TrayView(frame: r, side: side, rows: rows)
+        let t = TrayView(frame: r, text: tr.offsetBy(dx: -r.minX, dy: 0), pets: pr.offsetBy(dx: -r.minX, dy: 0), left: side == .left,
+                         row: row, compactUsage: compactUsage)
         view.addSubview(t)
         tray = t
-        pipHits = t.pips.map { (view.convert($0.rect, from: t), $0.key) }
         if fresh {
             t.alphaValue = 0
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.09) {
                 NSAnimationContext.runAnimationGroup { $0.duration = 0.22; t.animator().alphaValue = 1 }
             }
+        }
+        if ticker == nil {
+            let tk = DispatchSource.makeTimerSource(queue: .main)
+            tk.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+            tk.setEventHandler { [weak self] in self?.tray?.refresh() }
+            tk.resume()
+            ticker = tk
+        }
+    }
+
+    private func focus(_ key: String) {
+        guard focusKey != key else { return }
+        focusKey = key
+        if let st = strip, let i = st.keys.firstIndex(of: key) { roll = CGFloat(i); lens = nil }
+        render()
+    }
+
+    /// The span the picked pet's centre travels: first pet's resting spot to the last one's.
+    private func track(_ st: (area: CGRect, hit: CGRect, keys: [String], step: CGFloat)) -> (lo: CGFloat, hi: CGFloat) {
+        (st.area.minX + st.step / 2, st.area.maxX - st.step / 2)
+    }
+
+    /// Where an open side's pet stands under the fisheye, how large (the picked one largest) and
+    /// how faint, and how far back.
+    private func place(_ key: String) -> (pos: CGPoint, scale: CGFloat, opacity: Float, z: CGFloat)? {
+        guard let st = strip, let i = st.keys.firstIndex(of: key) else { return nil }
+        let n = st.keys.count
+        guard n > 1 else { return (CGPoint(x: st.area.midX, y: petY), petFit, 1, 0) }
+        let (lo, hi) = track(st)
+        let gap = (hi - lo) / CGFloat(n - 1)           // between resting spots
+        let p = min(hi, max(lo, lens ?? lo + (roll ?? 0) * gap))
+        let r = (p - lo) / gap
+        // Sarkar–Brown fisheye, magnified so the pets either side of the lens have room to
+        // breathe; the strip's ends stay put. Three or fewer need none.
+        let home = lo + CGFloat(i) * gap, k = n <= maxFlat ? 0 : max(0, 1.3 * st.step / gap - 1)
+        var x = home
+        if k > 0, home != p {
+            let edge = home < p ? lo : hi, span = abs(edge - p)
+            let d = span > 0 ? abs(home - p) / span : 0
+            x = p + (home < p ? -1 : 1) * span * (k + 1) * d / (k * d + 1)
+        }
+        let dd = CGFloat(i) - r, a = abs(dd)
+        let scale = 0.62 + 0.46 * exp(-dd * dd / 0.7)
+        let opacity = Float(n <= maxFlat ? max(0.3, min(1, 1.1 - 0.6 * a)) : max(0, min(1, 1.1 - 0.55 * a)))
+        return (CGPoint(x: x, y: petY), scale * petFit, opacity, -a)
+    }
+
+    /// Moves the lens with the pointer, in soft detents: each pet holds for the middle of its
+    /// stretch, then the next snaps in with a little overshoot. Picking a new one updates the text.
+    private func scroll(to px: CGFloat) {
+        guard let st = strip, st.keys.count > 1 else { return }
+        let (lo, hi) = track(st)
+        let gap = (hi - lo) / CGFloat(st.keys.count - 1)
+        let raw = (min(hi, max(lo, px)) - lo) / gap, i = raw.rounded(.down)
+        let t = min(1, max(0, (raw - i - 0.3) / 0.4))
+        let r = i + t * t * (3 - 2 * t)
+        guard r != roll || lens == nil else { return }
+        roll = r
+        lens = lo + r * gap
+        for k in st.keys {
+            guard let slot = slots[k], let p = place(k) else { continue }
+            for a in ["position", "transform.scale", "opacity"] { slot.layer.removeAnimation(forKey: a) }
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.22)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.3, 1.45, 0.55, 1))
+            slot.layer.position = p.pos
+            slot.layer.setValue(p.scale, forKeyPath: "transform.scale")
+            slot.layer.opacity = p.opacity
+            slot.layer.zPosition = p.z
+            CATransaction.commit()
+        }
+        let pick = st.keys[Int(roll!.rounded())]
+        if pick != focusKey {
+            focusKey = pick
+            render()
         }
     }
 
@@ -651,7 +825,6 @@ final class IslandController: NSObject {
         let p = pointer
         var rects = trayRects.map { $0.value.union(hovers[$0.key] ?? $0.value) }
         for (side, r) in hovers where trayRects[side] == nil { rects.append(r) }
-        if openSide != nil { rects += pipHits.map(\.rect) }
         // One area over the whole island that also reports movement inside it, so the open side
         // always follows the pointer, however fast it crosses the notch. Silent once outside.
         if var all = rects.first.map({ rects.dropFirst().reduce($0) { $0.union($1) } }) {
@@ -676,17 +849,15 @@ final class IslandController: NSObject {
             closeWork?.cancel()
             if s != openSide {
                 openSide = s
-                selected = [:]
-                keyFocus = nil
                 takeKeys()
                 refreshTitles()
                 // Looking counts as reading: finished sessions on this side go quiet.
                 for a in config.config.agents where a.placement == s { store.markSeen(a.id) }
                 render()
-            } else if let hit = pipHits.first(where: { $0.rect.contains(pointer) }), let sess = store.sessions[hit.key],
-                      selected[sess.agent] != hit.key {
-                selected[sess.agent] = hit.key
-                render()
+            } else if let st = strip, st.hit.contains(pointer) {
+                scroll(to: pointer.x)
+            } else if let hit = zoneHits.first(where: { $0.rect.contains(pointer) }) {
+                focus(hit.key)
             }
         } else if openSide != nil {
             closeWork?.cancel()
@@ -778,7 +949,7 @@ final class IslandController: NSObject {
     // MARK: keyboard
 
     /// While a tray is open the island takes the keyboard (without activating the app),
-    /// so ←/→ walk every session on that side, Return opens it, Esc closes.
+    /// so ←/→ walk its zones, Return opens the one picked, Esc closes.
     private func takeKeys() {
         guard !window.isKeyWindow else { return }
         keyOwner = NSWorkspace.shared.frontmostApplication
@@ -793,34 +964,17 @@ final class IslandController: NSObject {
         keyOwner = nil
     }
 
-    /// The open side's sessions in on-screen left-to-right order.
-    private func visualOrder() -> [(agent: String, key: String)] {
-        guard let side = openSide else { return [] }
-        var agents = config.config.agents.filter { $0.placement == side && store.summary($0.id) != nil }
-        if side == .left { agents.reverse() }
-        return agents.flatMap { a -> [(agent: String, key: String)] in
-            let keys = store.sessions(of: a.id).prefix(6).map { (a.id, $0.key) }
-            return side == .left ? Array(keys) : keys.reversed()
-        }
-    }
-
     func key(_ e: NSEvent) -> Bool {
         guard openSide != nil else { return false }
+        let order = strip?.keys ?? []
         switch e.keyCode {
         case 123, 124: // ← →
-            let order = visualOrder()
             guard !order.isEmpty else { return true }
-            let cur = keyFocus.flatMap { f in order.firstIndex { $0.agent == f && $0.key == (selected[f] ?? store.sessions(of: f).first?.key) } }
-            let next = cur.map { ($0 + (e.keyCode == 124 ? 1 : -1) + order.count) % order.count } ?? (e.keyCode == 124 ? 0 : order.count - 1)
-            keyFocus = order[next].agent
-            selected[order[next].agent] = order[next].key
-            render()
+            let step = e.keyCode == 124 ? 1 : -1
+            let next = focusKey.flatMap { order.firstIndex(of: $0) }.map { ($0 + step + order.count) % order.count } ?? 0
+            focus(order[next])
         case 36, 76: // Return
-            let id = keyFocus ?? visualOrder().first?.agent
-            if let id {
-                let ss = store.sessions(of: id)
-                if let s = ss.first(where: { $0.key == selected[id] }) ?? ss.first { openChat(s) }
-            }
+            if let k = focusKey ?? order.first, let s = store.sessions[k] { openChat(s) }
         case 53: // Esc
             openSide = nil
             render()
@@ -832,17 +986,18 @@ final class IslandController: NSObject {
 
     func click(_ raw: CGPoint) {
         let p = CGPoint(x: raw.x, y: min(raw.y, top - 0.5))
-        if let hit = pipHits.first(where: { $0.rect.contains(p) }), let s = store.sessions[hit.key] { return openChat(s) }
+        if let hit = zoneHits.first(where: { $0.rect.contains(p) }), let s = store.sessions[hit.key] { return openChat(s) }
+        // The text tells the focused session; a click there opens it.
+        if let side = openSide, side == self.side(at: p), let k = focusKey, let s = store.sessions[k] { return openChat(s) }
         // Anywhere else that hovers a side (padding, gaps, its half of the notch) clicks through to
         // that side's agent: the one picked with the arrows, else the one nearest the notch.
         var id = hits.first(where: { $0.value.contains(p) })?.key
         if id == nil, let side = side(at: p) {
             let mine = config.config.agents.filter { $0.placement == side && store.summary($0.id) != nil }.map(\.id)
-            id = mine.first { $0 == keyFocus } ?? mine.first
+            id = mine.first
         }
         guard let id else { return }
-        let ss = store.sessions(of: id)
-        if let s = ss.first(where: { $0.key == selected[id] }) ?? ss.first { openChat(s) }
+        if let s = store.sessions(of: id).first { openChat(s) }
     }
 
     func openChat(_ s: Session) {
@@ -870,7 +1025,7 @@ final class IslandController: NSObject {
         return CGPoint(x: r.midX, y: r.midY)
     }
 
-    /// For the demo driver: `mascot:<agent>`, `button:<label>` or `pip:<agent>:<n>` as a screen point (top-left origin,
+    /// For the demo driver: `mascot:<agent>`, `button:<label>` or `zone:<agent>:<n>` as a screen point (top-left origin,
     /// as CGEvent wants), or `state` for sessions and pending questions. JSON either way.
     func locate(_ what: String) -> String {
         func json(_ o: Any) -> String { (try? JSONSerialization.data(withJSONObject: o)).map { String(decoding: $0, as: UTF8.self) } ?? "{}" }
@@ -884,10 +1039,10 @@ final class IslandController: NSObject {
         switch parts[0] {
         case "mascot": p = mascot(parts[1])
         case "button": p = button(parts[1])
-        case "pip":   // pip:<agent>:<n>, the agent's n-th session dot in the open tray
+        case "pip", "zone":   // zone:<agent>:<n>, the agent's n-th session zone in the open tray
             let q = parts[1].split(separator: ":").map(String.init)
-            let mine = pipHits.filter { store.sessions[$0.key]?.agent == q.first }
-            if q.count == 2, let n = Int(q[1]), n < mine.count { p = CGPoint(x: mine[n].rect.midX, y: notch.midY + 7.5) }
+            let mine = zoneHits.filter { store.sessions[$0.key]?.agent == q.first }
+            if q.count == 2, let n = Int(q[1]), n < mine.count { p = CGPoint(x: mine[n].rect.midX, y: mine[n].rect.midY) }
         default: break
         }
         guard let p else { return "{}" }

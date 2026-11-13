@@ -1,7 +1,7 @@
 import AppKit
 import ImageIO
 
-enum Anim { case idle, working, question, done, interrupted, limited }
+enum Anim { case idle, working, question, done, interrupted, limited, waiting }
 
 /// All of a sprite's frames side by side in one small strip, so an animation is
 /// just a discrete `contentsRect` keyframe track the render server plays itself.
@@ -110,11 +110,11 @@ enum PetAtlas {
         (0, [1200, 110, 110, 140, 140, 700]),        // idle, resting longer between fidgets
         (4, [140, 140, 140, 140, 280]),               // jumping
         (5, [90, 90, 120, 120, 90, 90, 120, 160]),    // failed: a flustered shake
-        (6, [150, 150, 150, 150, 150, 260]),          // waiting
+        (6, [150, 150, 150, 150, 150, 260]),          // waiting (on you, or on a job)
         (7, [120, 120, 120, 120, 120, 220]),          // running
         (9, [260, 160, 160, 160, 200, 260, 320, 1]),  // flopping over, out of steam
     ]
-    private static let map: [Anim: Int] = [.idle: 0, .done: 4, .interrupted: 5, .question: 6, .working: 7, .limited: 9]
+    private static let map: [Anim: Int] = [.idle: 0, .done: 4, .interrupted: 5, .question: 6, .working: 7, .limited: 9, .waiting: 6]
     static let height = 96
 
     /// Prepared strips are cached as small PNGs, so later launches skip decoding the full atlas.
@@ -274,8 +274,12 @@ enum PixelPet {
                                 (P { $0.eyes = .shut }, 1)]
         let limited: [F] = [(P { $0.eyes = .left }, 380), (P { $0.eyes = .right }, 380), (P { $0.eyes = .shut }, 300),
                             (P { $0.crouch = true; $0.eyes = .shut }, 420), (P { $0.slump = true }, 1)]
+        // Sitting it out, glancing up and around now and then: a job is running elsewhere.
+        let waiting: [F] = [(P { $0.crouch = true }, 1800), (P { $0.crouch = true; $0.eyes = .up }, 900),
+                            (P { $0.crouch = true; $0.eyes = .shut }, 140), (P { $0.crouch = true }, 1400),
+                            (P { $0.crouch = true; $0.eyes = .right }, 700), (P { $0.crouch = true; $0.eyes = .left }, 700)]
         let all: [(Anim, [F])] = [(.idle, idle), (.working, working), (.question, question), (.done, done),
-                                  (.interrupted, interrupted), (.limited, limited)]
+                                  (.interrupted, interrupted), (.limited, limited), (.waiting, waiting)]
         let total = all.reduce(0) { $0 + $1.1.count }
         let fw = W * sx, fh = H * sy
         let ctx = CGContext(data: nil, width: fw * total, height: fh, bitsPerComponent: 8, bytesPerRow: 0,

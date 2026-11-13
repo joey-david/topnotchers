@@ -7,7 +7,9 @@ A minimal notch monitor for Claude Code and Codex on macOS.
 The island uses the notch's own black and shape, so it reads as part of the hardware, and with no
 agent running there is nothing on screen. Each session adds a small pixel pet beside the notch. It
 animates while the agent works, gets an orange dot when it asks you something and a green one when
-it's done. Hover a pet to see the task and what the agent is doing right now.
+it's done. Hover a side and its pets fan out, one per session; the one under the pointer says what
+it was asked and what it is doing right now. With more than three they ride a strip that scrolls as
+you sweep across it.
 
 Questions and permission prompts drop down under the notch, so you can answer without finding the
 terminal. Clicking a pet focuses its Ghostty tab, or opens the thread in ChatGPT for Codex sessions

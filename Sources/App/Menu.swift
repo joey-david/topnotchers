@@ -71,6 +71,7 @@ final class MenuController: NSObject, NSMenuDelegate {
             case .idle: it.image = dot(NSColor(white: 0.5, alpha: 1))
             case .interrupted: it.image = dot(NSColor(white: 0.75, alpha: 1))
             case .limited: it.image = dot(.systemRed)
+            case .waiting: it.image = dot(.systemTeal)
             }
             m.addItem(it)
         }

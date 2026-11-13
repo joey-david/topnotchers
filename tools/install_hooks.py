@@ -6,12 +6,12 @@ WAIT = 12 * 3600  # a question can sit until you get to it
 
 CLAUDE = [
     ('SessionStart', None, False), ('SessionEnd', None, False), ('UserPromptSubmit', None, False),
-    ('PostToolUse', None, False), ('Notification', None, False), ('Stop', None, False),
+    ('PreToolUse', None, False), ('PostToolUse', None, False), ('Notification', None, False), ('Stop', None, False),
     ('StopFailure', None, False), ('PreToolUse', 'AskUserQuestion', True), ('PermissionRequest', None, True),
 ]
 CODEX = [
     ('SessionStart', None, False), ('SessionEnd', None, False), ('UserPromptSubmit', None, False),
-    ('PostToolUse', None, False), ('Stop', None, False),
+    ('PreToolUse', None, False), ('PostToolUse', None, False), ('Stop', None, False),
 ]  # no PermissionRequest: an empty reply makes Codex ask you instead of its auto-reviewer
 
 

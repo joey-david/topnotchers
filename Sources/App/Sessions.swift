@@ -3,7 +3,9 @@ import AppKit
 enum AgentState: Int, Codable, Comparable {
     // Raw values are saved in sessions.json; urgency is `rank`.
     case idle, done, working, question, interrupted, limited
-    private var rank: Int { [0, 2, 4, 5, 1, 3][rawValue] }
+    /// Display only: its turn is over, but a Jean-Zay job it submitted is still in jz-watch's hands.
+    case waiting
+    private var rank: Int { [0, 3, 5, 6, 1, 4, 2][rawValue] }
     static func < (a: Self, b: Self) -> Bool { a.rank < b.rank }
 }
 
@@ -31,6 +33,9 @@ final class Session: Codable {
     /// Why an interrupted turn stopped, when it wasn't you; and when a usage limit lifts.
     var reason: String?
     var limitResets: Date?
+    /// When `action` began, and whether that tool is still running.
+    var actionSince: Date?
+    var toolRunning: Bool?
 
     init(agent: String, id: String, pid: Int32) { self.agent = agent; self.id = id; self.pid = pid }
     var key: String { agent + "/" + id }
@@ -38,6 +43,12 @@ final class Session: Codable {
     var inGhostty: Bool { term == "ghostty" || bundle == Focus.ghostty }
     /// A Codex thread run from the ChatGPT app rather than a terminal.
     var inChatGPT: Bool { bundle == Focus.chatgpt }
+
+    func setAction(_ text: String, running: Bool) {
+        if text != action || running { actionSince = Date() }
+        action = text
+        toolRunning = running
+    }
 }
 
 struct Question {
@@ -93,9 +104,11 @@ final class SessionStore {
     private var ignored = Set<String>()
     private var pendingMeta: [String: (parent: String?, app: Bool)] = [:]
     private static let url = islandHome.appendingPathComponent("sessions.json")
+    let jz = JZWatch.shared
     init(config: ConfigStore) {
         self.config = config
         restore()
+        jz.onChange = { [weak self] in self?.onChange?() }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
                                                           object: nil, queue: .main) { [weak self] _ in self?.checkFocus() }
     }
@@ -164,6 +177,8 @@ final class SessionStore {
             if sessions[key] != nil { remove(key); changed() }
         }
         if ignored.contains(key) { return conn.respond("") }
+        // The bare PreToolUse hook fires for AskUserQuestion too, beside the waiting one that shows it.
+        if event == "PreToolUse", msg["wait"] as? Bool != true, p["tool_name"] as? String == "AskUserQuestion" { return conn.respond("") }
 
         if event == "SessionEnd" || emitted == "end" {
             remove(key)
@@ -206,6 +221,7 @@ final class SessionStore {
             s.action = nil
             s.reason = nil
             s.limitResets = nil
+            s.toolRunning = nil
             if let text = p["prompt"] as? String, let line = Self.request(text) { s.prompt = line }
             if s.parent == nil { Focus.captureTerminal(s) }
         case "Notification":
@@ -223,6 +239,7 @@ final class SessionStore {
                 made = Pending(session: s, kind: .ask(qs, input: input), conn: conn)
             }
         case "Stop", "Interrupt":
+            s.toolRunning = nil
             s.state = .done
             s.seen = false
         case "StopFailure":
@@ -230,7 +247,7 @@ final class SessionStore {
             if error == "rate_limit" || error == "billing_error" { limit(s) } else { stop(s, why: TranscriptWatch.reason(error)) }
         case "emit":
             if let t = msg["prompt"] as? String { s.prompt = t }
-            if let t = msg["action"] as? String { s.action = t }
+            if let t = msg["action"] as? String { s.setAction(t, running: false) }
             switch emitted {
             case "working": s.state = .working
             case "question": s.state = .question
@@ -239,8 +256,10 @@ final class SessionStore {
             case "limited": limit(s)
             default: s.state = .idle
             }
-        default: // PostToolUse, SubagentStart, PreCompact, ...
-            if let tool = p["tool_name"] as? String { s.action = Self.describe(tool, p["tool_input"]) }
+        default: // PreToolUse, PostToolUse, SubagentStart, PreCompact, ...
+            if let tool = p["tool_name"] as? String {
+                s.setAction(Self.describe(tool, p["tool_input"]), running: event == "PreToolUse")
+            }
             if !pending.contains(where: { $0.session === s }) { s.state = .working }
         }
 
@@ -332,8 +351,12 @@ final class SessionStore {
         return AgentSummary(state: states.max() ?? .idle, count: mine.count, states: states)
     }
 
+    /// Jean-Zay jobs a session is waiting on.
+    func jobs(_ s: Session) -> [String] { jz.jobs[s.id] ?? [] }
+
     func displayState(_ s: Session) -> AgentState {
         if pending.contains(where: { $0.session === s }) { return .question }
+        if [.idle, .done, .interrupted].contains(s.state), jz.jobs[s.id] != nil { return .waiting }
         if s.state == .done && s.seen { return .idle }
         return s.state
     }
@@ -539,8 +562,10 @@ final class SessionStore {
         case "Read": return "Reading " + (file ?? "files")
         case "Grep", "Glob": return "Searching the code"
         case "WebFetch", "WebSearch", "web_search": return "Browsing the web"
-        case "Task", "Agent": return "Delegating to a subagent"
-        case "TodoWrite", "update_plan": return "Planning"
+        case "Task", "Agent": return (d["description"] as? String).map { "Subagent: " + $0 } ?? "Delegating to a subagent"
+        case "TodoWrite", "update_plan", "TaskCreate", "TaskUpdate", "TaskList", "ExitPlanMode", "EnterPlanMode": return "Planning"
+        case "Skill": return (d["skill"] as? String).map { "Using the \($0) skill" } ?? "Using a skill"
+        case "AskUserQuestion": return "Asking you"
         default: return tool.hasPrefix("mcp__") ? "Using " + (tool.split(separator: "_").dropFirst(2).first.map(String.init) ?? "a tool") : tool
         }
     }
